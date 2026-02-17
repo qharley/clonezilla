@@ -1,0 +1,265 @@
+#!/bin/bash
+# Author: Steven Shiau <steven _at_ clonezilla org>
+# License: GPL
+# In this example, it will allow your user to use clonezilla live to choose
+# (1) backup the image of a local disk to a samba share with hwid-based path
+# (2) restore the image from a samba share with hwid-based path to a local disk
+# The samba share and the hwid-based path will be automatically prepared by the script.
+# The hwid is determined by the machine uuid or mac address, and sanitized to be used as folder name. 
+# So you can use the same clonezilla live iso/usb to backup/restore different machines without worrying about the image path.
+#
+# When this script is ready, you can run
+# ocs-iso -g en_US.UTF-8 -k NONE -s -m ./custom-ocs
+# to create the iso file for CD/DVD. or
+# ocs-live-dev -g en_US.UTF-8 -k NONE -s -c -m ./custom-ocs
+# to create the zip file for USB flash drive.
+
+# Begin of the scripts:
+# Load DRBL setting and functions
+DRBL_SCRIPT_PATH="${DRBL_SCRIPT_PATH:-/usr/share/drbl}"
+
+. $DRBL_SCRIPT_PATH/sbin/drbl-conf-functions
+. /etc/drbl/drbl-ocs.conf
+. $DRBL_SCRIPT_PATH/sbin/ocs-functions
+
+# load the setting for clonezilla live.
+[ -e /etc/ocs/ocs-live.conf ] && . /etc/ocs/ocs-live.conf
+# Load language files. For English, use "en_US.UTF-8".
+ask_and_load_lang_set en_US.UTF-8
+
+# The above is almost necessary, it is recommended to include them in your own custom-ocs.
+# From here, you can write your own scripts.
+
+# -------------------------------
+# Samba repository configuration
+# -------------------------------
+# Format: //server/share
+SMB_SHARE="//192.168.200.4/storage/images"
+SMB_USER="clonezilla"
+SMB_PASS="L@bn4s_XP"
+SMB_DOMAIN=""
+# Set empty to use kernel default negotiation.
+SMB_VERSION="3.0"
+
+# Temporary mount point for the whole samba share.
+SMB_MNT_BASE="/tmp/ocs-samba-repo"
+
+# Runtime variables
+src_disk=""
+tgt_disk=""
+hwid=""
+hwid_repo=""
+bind_mounted="no"
+samba_mounted="no"
+
+configure_network() {
+  # Follow custom-ocs-1 behavior: prepare network before mounting samba repo.
+  ocs-live-netcfg
+}
+
+check_repo_ready() {
+  if ! mountpoint "$ocsroot" &>/dev/null; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "Fail to find the Clonezilla image home $ocsroot!"
+    echo "Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    cleanup_repo_mounts
+    exit 1
+  fi
+}
+
+# functions
+list_local_disks() {
+  # Output format: /dev/disk|size|model|removable_flag
+  LC_ALL=C lsblk -dn -o NAME,TYPE,SIZE,MODEL,RM 2>/dev/null | awk '
+    $2 == "disk" {
+      model=$4
+      if (model == "") model="unknown-model"
+      print "/dev/"$1"|"$3"|"model:"model" rm:"$5
+    }
+  '
+}
+
+choose_disk() {
+  local action_label="$1"
+  local menu_tmp menu_items disk_list selected_disk
+
+  menu_tmp="$(mktemp /tmp/disk-menu.XXXXXX)"
+  disk_list="$(list_local_disks)"
+
+  if [ -z "$disk_list" ]; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "No local disks found for $action_label."
+    echo "Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    [ -f "$menu_tmp" ] && rm -f "$menu_tmp"
+    exit 1
+  fi
+
+  menu_items=()
+  while IFS='|' read -r disk_path disk_size disk_desc; do
+    [ -z "$disk_path" ] && continue
+    menu_items+=("$disk_path" "$disk_size $disk_desc")
+  done <<EOF
+$disk_list
+EOF
+
+  $DIA --backtitle "$msg_nchc_free_software_labs" --title "$msg_nchc_clonezilla" \
+    --menu "Choose disk to $action_label:" 0 0 0 "${menu_items[@]}" 2> "$menu_tmp"
+  selected_disk="$(cat "$menu_tmp" 2>/dev/null)"
+  [ -f "$menu_tmp" ] && rm -f "$menu_tmp"
+
+  if [ -z "$selected_disk" ]; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "No disk selected. Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    exit 1
+  fi
+
+  echo "$selected_disk"
+}
+
+confirm_restore_target() {
+  local ask_tmp ans
+  ask_tmp="$(mktemp /tmp/restore-confirm.XXXXXX)"
+  $DIA --backtitle "$msg_nchc_free_software_labs" --title "$msg_nchc_clonezilla" \
+    --yesno "Restore image 'backup' from $SMB_SHARE/$hwid to $tgt_disk ?\n\nWARNING: All data on $tgt_disk will be overwritten." 0 0
+  ans=$?
+  [ -f "$ask_tmp" ] && rm -f "$ask_tmp"
+  [ "$ans" -eq 0 ]
+}
+
+sanitize_hwid() {
+  local raw_id="$1"
+  echo "$raw_id" | tr '[:upper:]' '[:lower:]' | sed -r -e 's/[^a-z0-9._-]+/-/g' -e 's/^-+//g' -e 's/-+$//g'
+}
+
+get_hwid() {
+  local raw_hwid=""
+
+  if [ -r /sys/class/dmi/id/product_uuid ]; then
+    raw_hwid="$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | head -n 1)"
+  fi
+
+  if [ -z "$raw_hwid" ] && type dmidecode &>/dev/null; then
+    raw_hwid="$(LC_ALL=C dmidecode -s system-uuid 2>/dev/null | head -n 1)"
+  fi
+
+  if [ -z "$raw_hwid" ]; then
+    raw_hwid="$(LC_ALL=C cat /sys/class/net/*/address 2>/dev/null | grep -Eiv '^(00:00:00:00:00:00|ff:ff:ff:ff:ff:ff)$' | head -n 1)"
+  fi
+
+  if [ -z "$raw_hwid" ]; then
+    raw_hwid="$(hostname 2>/dev/null)"
+  fi
+
+  hwid="$(sanitize_hwid "$raw_hwid")"
+  [ -z "$hwid" ] && hwid="unknown-hwid"
+}
+
+cleanup_repo_mounts() {
+  if [ "$bind_mounted" = "yes" ] && mountpoint "$ocsroot" &>/dev/null; then
+    umount "$ocsroot" &>/dev/null
+  fi
+  if [ "$samba_mounted" = "yes" ] && mountpoint "$SMB_MNT_BASE" &>/dev/null; then
+    umount "$SMB_MNT_BASE" &>/dev/null
+  fi
+}
+
+prepare_samba_hwid_repo() {
+  local mnt_opt
+
+  mkdir -p "$SMB_MNT_BASE" "$ocsroot"
+
+  if [ -z "$(LC_ALL=C lsmod | grep -Ew '^cifs')" ]; then
+    modprobe cifs &>/dev/null
+  fi
+
+  mnt_opt="rw,username=${SMB_USER},password=${SMB_PASS}"
+  [ -n "$SMB_DOMAIN" ] && mnt_opt="${mnt_opt},domain=${SMB_DOMAIN}"
+  [ -n "$SMB_VERSION" ] && mnt_opt="${mnt_opt},vers=${SMB_VERSION}"
+
+  if ! mount -t cifs "$SMB_SHARE" "$SMB_MNT_BASE" -o "$mnt_opt"; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "Failed to mount Samba share $SMB_SHARE on $SMB_MNT_BASE"
+    echo "Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    exit 1
+  fi
+  samba_mounted="yes"
+
+  hwid_repo="$SMB_MNT_BASE/$hwid"
+  mkdir -p "$hwid_repo"
+
+  if mountpoint "$ocsroot" &>/dev/null; then
+    umount "$ocsroot" &>/dev/null
+  fi
+
+  if ! mount --bind "$hwid_repo" "$ocsroot"; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "Failed to bind mount HWID folder $hwid_repo to $ocsroot"
+    echo "Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    cleanup_repo_mounts
+    exit 1
+  fi
+  bind_mounted="yes"
+}
+
+action_backup() {
+  src_disk="$(choose_disk "back up")"
+
+  # If you want to run it in batch mode, add option "-b" in the ocs-sr command
+  # For more options about ocs-sr, run "ocs-sr -h"
+  ocs-sr -q2 -c -j2 -z1p -i 2000 -p true savedisk "backup" "$src_disk"
+}
+ 
+action_restore() {
+  tgt_disk="$(choose_disk "restore to")"
+  if ! confirm_restore_target; then
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "Restore cancelled by user."
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    return 1
+  fi
+
+  # If you want to run it in batch mode, add option "-b" in the ocs-sr command
+  # For more options about ocs-sr, run "ocs-sr -h"
+  ocs-sr -g auto -e1 auto -e2 -c -r -j2 -p true restoredisk "backup" "$tgt_disk"
+} 
+
+##################
+###### MAIN ######
+##################
+# Find machine hwid
+get_hwid
+
+configure_network
+prepare_samba_hwid_repo
+check_repo_ready
+
+TMP="$(mktemp /tmp/menu.XXXXXX)"
+trap '[ -f "$TMP" ] && rm -f "$TMP"; cleanup_repo_mounts' HUP INT QUIT TERM EXIT
+$DIA --backtitle "$msg_nchc_free_software_labs" --title  \
+"$msg_nchc_clonezilla" --menu "$msg_choose_mode:" \
+0 0 0 \
+"Backup"  "Backup one local disk to $SMB_SHARE/$hwid/backup" \
+"Restore" "Restore from $SMB_SHARE/$hwid/backup to a selected local disk" \
+2> $TMP
+mode="$(cat $TMP)"
+[ -f "$TMP" ] && rm -f $TMP
+
+#
+case "$mode" in
+  Backup)
+    action_backup;;
+  Restore)
+    action_restore;;
+  *)
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo "Program terminated!"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    exit 1
+esac
+
+cleanup_repo_mounts
